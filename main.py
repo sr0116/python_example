@@ -43,8 +43,9 @@ class Mutation:
     @strawberry.mutation
     def createEmployee(self, input: EmployeeInput) -> Employee:
         # 등록 쿼리
+        global EMPLOYEES
         new_emp = Employee(
-            id = 10,
+            id = str(max(int (e.id) for e in EMPLOYEES) + 1),
             name = input.name,
             age = input.age,
             job = input.job,
