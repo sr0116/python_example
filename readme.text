@@ -1,0 +1,65 @@
+ pip install -r .\requirements.txt
+
+ uvicorn main:app --reload --port 3001
+
+// 쿼리 Query
+
+query {
+  employees {
+    id
+    name
+    age
+    job
+    language
+    pay
+  }
+}
+
+// 뮤테이션 Mutation
+
+########## post ##########
+mutation {
+  createEmployee(
+    input: {
+      name: "Taylor"
+      age: 29
+      job: "backend"
+      language: "python"
+      pay: 410
+    }
+  ) {
+    id
+    name
+    age
+    job
+    language
+    pay
+  }
+}
+
+######## put #############
+mutation {
+  updateEmployee(
+    id: "2"
+    input: {
+      name: "Peter"
+      age: 30
+      job: "backend"
+      language: "java"
+      pay: 350
+    }
+  ) {
+    id
+    name
+    age
+    job
+    language
+    pay
+  }
+}
+
+######## delete ############
+
+mutation {
+  deleteEmployee(id: "3")
+}
