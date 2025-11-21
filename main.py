@@ -1,30 +1,47 @@
 import strawberry
-from typing import Optional, List
+from typing import List
 from fastapi import FastAPI
-from starlette.middleware.cors import CORSMiddleware
 from strawberry.fastapi import GraphQLRouter
-# from db.database import Base, Session as SessionLocal, engine
-from db.models import EmployeeModel
-import redis
+from starlette.middleware.cors import CORSMiddleware
 
-r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-
-EMPLOYEE_ID_COUNTER_KEY = "employee:id:counter"
-EMPLOYEE_ALL_SET_KEY = "employee:all-set"
+from pymongo import MongoClient
+from bson.objectid import ObjectId
 
 
-def employee_redis_key(emp_id: int) -> str:
-    return f"employee:id:{emp_id}"
+# ==============================
+# 1) MongoDB 연결
+# ==============================
+client = MongoClient("mongodb://admin:admin1234@localhost:27017/?authSource=admin")
+db = client["employee_db"]
+employees_col = db["employees"]
+counter_col = db["counters"]  # ID 자동 증가용
 
 
+# ==============================
+# 2) Counter(시퀀스) 함수
+# ==============================
+def get_next_sequence(name: str) -> int:
+    result = counter_col.find_one_and_update(
+        {"_id": name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True
+    )
+    return result["seq"]
+
+
+# ==============================
+# 3) GraphQL 타입 정의
+# ==============================
 @strawberry.type
 class Employee:
     id: strawberry.ID
     name: str
     age: int
     job: str
-    language:str
+    language: str
     pay: int
+
 
 @strawberry.input
 class EmployeeInput:
@@ -34,127 +51,92 @@ class EmployeeInput:
     language: str
     pay: int
 
-# ORM 객체 -> GraphQL 타입 변환 도움미
-def redis_to_graphql(emp_id: int, emp: dict) -> Employee:
+
+# ==============================
+# 4) Mongo → GraphQL 변환 함수
+# ==============================
+def mongo_to_graphql(doc) -> Employee:
     return Employee(
-        id = str(emp_id),
-        name = emp.name,
-        age= emp.age,
-        job= emp.job,
-        language = emp.language,
-        pay = emp.pay
+        id=str(doc["id"]),
+        name=doc["name"],
+        age=doc["age"],
+        job=doc["job"],
+        language=doc["language"],
+        pay=doc["pay"]
     )
 
+
+# ==============================
+# 5) Query
+# ==============================
 @strawberry.type
 class Query:
     @strawberry.field
     def employees(self) -> List[Employee]:
-        ids = r.smembers(EMPLOYEE_ALL_SET_KEY)
-        result: List[Employee] = []
-        for id_str in ids:
-            key = employee_redis_key(int(id_str))
-            data = r.hgetall(key)
-            if data:
-                result.append(redis_to_graphql(int(id_str), data))
-        result.sort(key=lambda emp: emp.id)
-        return result
+        docs = employees_col.find().sort("id", 1)
+        return [mongo_to_graphql(doc) for doc in docs]
 
+
+# ==============================
+# 6) Mutation
+# ==============================
 @strawberry.type
 class Mutation:
-    # Redis 등록 로직
     @strawberry.mutation
     def createEmployee(self, input: EmployeeInput) -> Employee:
-        # 새 직원 ID 생성
-        new_id = r.incr(EMPLOYEE_ID_COUNTER_KEY)
+        new_id = get_next_sequence("employee_id")
 
-        key = employee_redis_key(new_id)
+        doc = {
+            "id": new_id,
+            "name": input.name,
+            "age": input.age,
+            "job": input.job,
+            "language": input.language,
+            "pay": input.pay
+        }
 
-        # Redis Hash에 저장
-        r.hset(
-            key,
-            mapping={
-                "name": input.name,
-                "age": input.age,
-                "job": input.job,
-                "language": input.language,
-                "pay": input.pay,
-            },
-        )
+        employees_col.insert_one(doc)
 
-        # 전체 목록 집합에 추가
-        r.sadd(EMPLOYEE_ALL_SET_KEY, new_id)
-
-        # 방금 저장된 데이터 가져오기
-        data = r.hgetall(key)
-
-        # Employee GraphQL 타입 변환
-        return Employee(
-            id=str(new_id),
-            name=data["name"],
-            age=int(data["age"]),
-            job=data["job"],
-            language=data["language"],
-            pay=int(data["pay"]),
-        )
+        return mongo_to_graphql(doc)
 
     @strawberry.mutation
     def updateEmployee(self, id: strawberry.ID, input: EmployeeInput) -> Employee:
         emp_id = int(id)
-        key = employee_redis_key(emp_id)
 
-        # 존재 여부 확인
-        if not r.exists(key):
+        doc = employees_col.find_one({"id": emp_id})
+        if not doc:
             raise ValueError("Employee not found")
 
-        # Hash 업데이트
-        r.hset(
-            key,
-            mapping={
+        employees_col.update_one(
+            {"id": emp_id},
+            {"$set": {
                 "name": input.name,
                 "age": input.age,
                 "job": input.job,
                 "language": input.language,
                 "pay": input.pay,
-            },
+            }}
         )
 
-        updated_data = r.hgetall(key)
-
-        return Employee(
-            id=str(emp_id),
-            name=updated_data["name"],
-            age=int(updated_data["age"]),
-            job=updated_data["job"],
-            language=updated_data["language"],
-            pay=int(updated_data["pay"]),
-        )
+        updated = employees_col.find_one({"id": emp_id})
+        return mongo_to_graphql(updated)
 
     @strawberry.mutation
     def deleteEmployee(self, id: strawberry.ID) -> strawberry.ID:
         emp_id = int(id)
-        key = employee_redis_key(emp_id)
 
-        # 존재 여부
-        if not r.exists(key):
+        result = employees_col.delete_one({"id": emp_id})
+        if result.deleted_count == 0:
             raise ValueError("Employee not found")
-
-        # 직원 Hash 삭제
-        r.delete(key)
-
-        # 전체 목록 Set에서도 제거
-        r.srem(EMPLOYEE_ALL_SET_KEY, emp_id)
 
         return strawberry.ID(str(emp_id))
 
 
-schema = strawberry.Schema(query=Query, mutation=Mutation)
-graphql_app = GraphQLRouter(schema)
-
+# ==============================
+# 7) 초기 샘플 데이터 세팅
+# ==============================
 def init_sample_data():
-    """서버 최초 실행 시 Redis에 샘플 직원 데이터 넣기 (이미 있으면 스킵)"""
-
-    # 이미 직원 데이터가 존재하면 스킵
-    if r.scard(EMPLOYEE_ALL_SET_KEY) > 0:
+    if employees_col.count_documents({}) > 0:
         return
 
     samples = [
@@ -165,20 +147,14 @@ def init_sample_data():
     ]
 
     for emp in samples:
-        # 새로운 ID 증가
-        new_id = r.incr(EMPLOYEE_ID_COUNTER_KEY)
-
-        # 키 구성
-        key = employee_redis_key(new_id)
-
-        # Redis Hash 저장
-        r.hset(key, mapping=emp)
-
-        # 전체 직원 목록 set 추가
-        r.sadd(EMPLOYEE_ALL_SET_KEY, new_id)
+        new_id = get_next_sequence("employee_id")
+        emp_doc = {"id": new_id, **emp}
+        employees_col.insert_one(emp_doc)
 
 
-
+# ==============================
+# 8) FastAPI 설정
+# ==============================
 app = FastAPI()
 
 
@@ -187,12 +163,11 @@ def startup_event():
     init_sample_data()
 
 
-# CORS 설정
+# CORS
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -201,15 +176,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# GraphQL 라우터
+schema = strawberry.Schema(query=Query, mutation=Mutation)
+graphql_app = GraphQLRouter(schema)
 app.include_router(graphql_app, prefix="/graphql")
 
 
 @app.get("/")
 async def root():
-    return {"message": "FastAPI GraphQL Employee 서버 동작 중....."}
-
-
-
-
-
-
+    return {"message": "FastAPI Mongo + GraphQL Employee Server Running"}

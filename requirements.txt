@@ -3,4 +3,4 @@ uvicorn
 strawberry-graphql
 sqlalchemy
 python-dotenv
-redis
+pymongo
